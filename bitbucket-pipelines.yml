@@ -1,0 +1,165 @@
+image: python:3.9 # Base image
+
+# --- Reusable Step Definitions (YAML Anchors) ---
+definitions:
+  services:
+    docker:
+      memory: 3072 # Increased memory maybe needed for larger images
+  caches:
+    pip: ~/.cache/pip
+    docker: /var/lib/docker
+    terraform: $HOME/.terraform.d/plugin-cache
+  steps:
+    # --- COMMON STEPS ---
+    - step: &lint-test # Checks ALL python code
+        name: Lint and Unit Test (All)
+        caches:
+          - pip
+        script:
+          - pip install -r requirements-dev.txt
+          - echo "Running Linter..."
+          - flake8 scripts/ tests/
+          - echo "Running Unit Tests..."
+          - pytest tests/unit/ # Run all unit tests
+        artifacts:
+          - tests/pytest-report.xml
+
+    - step: &validate-terraform-all # Checks ALL terraform code
+        name: Validate Terraform Code (All Stacks)
+        image: hashicorp/terraform:1.5
+        script:
+          - echo "Validating Ingestion Terraform..."
+          - cd ingestion && terraform init -backend=false && terraform validate && terraform fmt -check && cd ..
+          - echo "Validating EDF Training Terraform..."
+          - cd training_edf && terraform init -backend=false && terraform validate && terraform fmt -check && cd ..
+          - echo "Validating EDF Inference Terraform..."
+          - cd inference_edf && terraform init -backend=false && terraform validate && terraform fmt -check && cd ..
+
+    # --- CONTAINER BUILDS (Separate per workflow if different dependencies) ---
+    - step: &build-push-edf-container
+        name: Build and Push EDF Training/Inference Container
+        services:
+          - docker
+        caches:
+          - docker
+        script:
+          # Required Repo Vars: AWS_..., ECR_REPOSITORY_NAME_EDF
+          - echo "Building EDF Docker image..."
+          - > # Assuming EDF uses a different Dockerfile/context if needed
+            docker build -t $ECR_REPOSITORY_NAME_EDF:$BITBUCKET_COMMIT \
+            --file scripts/training_edf/Dockerfile scripts/training_edf/ # Use EDF specific path
+          - echo "Logging into AWS ECR..."
+          - pipe: amazon/aws-ecr-push-image:1.6.1
+            variables: # Use REPO vars for CI build
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              IMAGE_NAME: $ECR_REPOSITORY_NAME_EDF # Use EDF repo name var
+              TAGS: $BITBUCKET_COMMIT,latest
+
+# --- Pipeline Definitions ---
+pipelines:
+  # CI Pipeline (Feature branches or PRs)
+  branches:
+    'feature/**':
+      - step: *lint-test
+      - parallel: # Build containers in parallel
+          - step: *build-push-edf-container
+      - step: *validate-terraform-all
+    # Add PR pipeline if needed
+
+  # CD / Integration Test Pipelines (Manual Triggers)
+  custom:
+    # --- EDF Training Workflow CD ---
+    deploy-and-test-edf-training:
+      - step:
+          name: CD EDF Training - Checks & Build
+          trigger: manual
+          steps:
+            - step: *lint-test
+            - step: *build-push-edf-container # Use EDF specific build
+      - step:
+          name: CD EDF Training - Deploy Infra & Run Integration Tests
+          deployment: test
+          trigger: manual
+          image: python:3.9
+          caches: [pip, terraform]
+          script:
+            # 1. Install Deps & Configure AWS
+            - apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
+            - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip && unzip terraform.zip && mv terraform /usr/local/bin/ && rm terraform.zip
+            - pip install -r requirements-dev.txt
+            - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
+            - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
+            - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION
+            # 2. Deploy EDF Training Infra
+            - cd training_edf # Go to EDF training TF dir
+            - terraform init
+            # Pass TF_VAR_... vars using DEPLOY_... BB vars
+            - export TF_VAR_training_image_uri_edf="${DEPLOY_AWS_ACCOUNT_ID}.dkr.ecr.${DEPLOY_AWS_DEFAULT_REGION}.amazonaws.com/${DEPLOY_ECR_REPOSITORY_NAME_EDF}:${BITBUCKET_COMMIT}" # Use EDF image URI
+            - export TF_VAR_processed_bucket_name=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TF_VAR_scripts_bucket_name=$DEPLOY_SCRIPTS_BUCKET_NAME
+            # Pass other vars: roles ARNs, feature group name, model group name etc.
+            - terraform apply -auto-approve
+            # 3. Set Env Vars for EDF Integ Test
+            - export TEST_EDF_TRAINING_SFN_ARN=$(terraform output -raw edf_training_state_machine_arn)
+            - export TEST_EDF_MODEL_PKG_GROUP=$DEPLOY_EDF_MODEL_PKG_GROUP
+            - export TEST_PROCESSED_BUCKET=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TEST_EDF_TRAINING_IMAGE_URI=$TF_VAR_training_image_uri_edf # Pass image to test script
+            - export BITBUCKET_COMMIT=$BITBUCKET_COMMIT
+            # Export other TEST_... vars needed by EDF training test script
+            # 4. Prepare EDF Test Data (Placeholder)
+            - echo "INFO: Ensuring EDF training integration test data exists..."
+            # 5. Run EDF Training Integration Tests
+            - cd .. # Back to root
+            - pytest tests/integration/test_training_workflow.py -v --junitxml=tests/edf-training-integration-report.xml
+          artifacts:
+            - tests/edf-training-integration-report.xml
+
+    # --- EDF Inference Workflow CD ---
+    deploy-and-test-edf-inference:
+      - step: # Optional checks/build
+          name: CD EDF Inference - Checks (Optional)
+          trigger: manual
+          steps:
+            - step: *lint-test
+            # No build needed if using same container as training
+      - step:
+          name: CD EDF Inference - Deploy Infra & Run Integration Tests
+          deployment: test
+          trigger: manual
+          image: python:3.9
+          caches: [pip, terraform]
+          script:
+            # 1. Install Deps & Configure AWS
+            - apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
+            - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip && unzip terraform.zip && mv terraform /usr/local/bin/ && rm terraform.zip
+            - pip install -r requirements-dev.txt # Make sure awswrangler is here if test needs it
+            - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
+            - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
+            - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION
+            # 2. Deploy EDF Inference Infra
+            - cd inference_edf
+            - terraform init
+            # Pass TF_VAR_... vars using DEPLOY_... BB vars
+            - export TF_VAR_processed_bucket_name=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TF_VAR_scripts_bucket_name=$DEPLOY_SCRIPTS_BUCKET_NAME
+            - export TF_VAR_edf_model_package_group_name=$DEPLOY_EDF_MODEL_PKG_GROUP # Needs the right group
+            - export TF_VAR_edf_training_image_uri="${DEPLOY_AWS_ACCOUNT_ID}.dkr.ecr.${DEPLOY_AWS_DEFAULT_REGION}.amazonaws.com/${DEPLOY_ECR_REPOSITORY_NAME_EDF}:latest" # Usually use latest approved for inference test trigger
+            # Pass role ARNs, Timestream names etc.
+            - export TF_VAR_timestream_db_name=$DEPLOY_TIMESTREAM_DB_NAME # Example
+            - terraform apply -auto-approve
+            # 3. Set Env Vars for EDF Integ Test
+            - export TEST_EDF_INFERENCE_SFN_ARN=$(terraform output -raw edf_inference_state_machine_arn)
+            # Export other TEST_... vars: DB names, model group, bucket
+            - export TEST_EDF_MODEL_PKG_GROUP=$DEPLOY_EDF_MODEL_PKG_GROUP
+            - export TEST_PROCESSED_BUCKET=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TEST_TIMESTREAM_DB_NAME=$DEPLOY_TIMESTREAM_DB_NAME
+            - export TEST_TIMESTREAM_TABLE_NAME=$(terraform output -raw edf_forecast_db_details | jq -r .table_name) # Example using jq to parse output if complex
+            # 4. Prepare EDF Inference Test Data (Placeholder - CHECK APPROVED MODEL EXISTS for EDF group)
+            - echo "INFO: Ensuring EDF inference test data (processed & weather fcst) & APPROVED model exist..."
+            # 5. Run EDF Inference Integration Tests
+            - cd .. # Back to root
+            - pytest tests/integration/test_inference_workflow.py -v --junitxml=tests/edf-inference-integration-report.xml
+          artifacts:
+            - tests/edf-inference-integration-report.xml

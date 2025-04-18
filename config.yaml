@@ -1,0 +1,120 @@
+# config/.yaml
+
+# --- General Settings ---
+project_name: "hometech-ml"
+aws_region: "eu-central-1"
+# env_suffix will likely be passed dynamically or set per deployment environment
+
+# --- Data Paths (Templates - Execution specific paths often constructed) ---
+# Base paths defined here, execution IDs/dates appended by scripts/workflows
+s3_processed_edf_path: "s3://{processed_bucket}/processed_edf_data/"
+s3_raw_weather_fcst_path: "s3://{raw_bucket}/edf-inputs/weather-forecast/"
+s3_raw_calendar_path: "s3://{raw_bucket}/edf-inputs/calendar-topology/"
+s3_feature_output_base: "s3://{processed_bucket}/features/edf/{workflow_type}/{sfn_name}/{exec_id}/" # workflow_type=training/inference
+s3_model_artifact_base: "s3://{processed_bucket}/model-artifacts/{sfn_name}/{exec_id}/"
+s3_eval_report_base: "s3://{processed_bucket}/evaluation-output/{sfn_name}/{exec_id}/"
+s3_forecast_output_base: "s3://{processed_bucket}/forecast-output/{sfn_name}/{exec_id}/"
+
+# --- AWS Resource Names (Base names - suffix added in Terraform locals) ---
+scripts_bucket_base: "hometech-ml-glue-scripts" # Base name for script bucket
+processed_bucket_base: "hometech-ml-processed-data" # Base name for processed bucket
+raw_bucket_base: "hometech-ml-raw-data" # Base name for raw bucket
+edf_feature_group_name_base: "edf-building-features"
+ecr_repo_name_edf_base: "edf-training-container"
+edf_model_package_group_name_base: "EDFBuildingDemandForecaster"
+lambda_register_edf_func_base: "RegisterEDFModelFunction"
+lambda_load_forecasts_func_base: "LoadEDFResultsLambda"
+lambda_get_model_func_base: "GetApprovedModelLambda" # Shared Lambda
+lambda_create_sm_model_func_base: "CreateSageMakerModelLambda" # Shared Lambda
+edf_training_sfn_base: "EDFTrainingWorkflow"
+edf_inference_sfn_base: "EDFInferenceWorkflow"
+edf_scheduler_base: "DailyEDFInferenceTrigger"
+forecast_db_base: "EDFDatabase" # Timestream DB base name
+forecast_table_name: "BuildingDemandForecasts" # Timestream table name
+
+# --- Feature Engineering (Common & EDF Specific) ---
+common_feature_eng:
+  lookback_days_default: 14 # Default days history needed
+
+edf_feature_eng:
+  target_column: "consumption_kwh"
+  timestamp_column: "timestamp_hour"
+  building_id_column: "building_id"
+  time_features: # Features derived from timestamp
+    - "hour_of_day"
+    - "day_of_week"
+    - "day_of_month"
+    - "month_of_year"
+    - "is_weekend" # Example custom flag
+  lag_features: # Lag values in hours
+    consumption_kwh: [24, 48, 168] # 1d, 2d, 1wk
+    temperature_c: [24, 48, 168]
+    solar_irradiance_ghi: [24]
+  rolling_window_features: # Window size in hours, aggregations
+    consumption_kwh:
+      windows: [3, 24, 168]
+      aggs: ["avg", "stddev", "min", "max"]
+    temperature_c:
+      windows: [24]
+      aggs: ["avg"]
+  imputation_value: 0.0 # Value used for fillna after lags/windows
+
+# --- Training Workflow ---
+edf_training:
+  default_strategy: "Prophet" # Model strategy to use if not specified
+  instance_type: "ml.m5.xlarge" # Larger instance for potentially heavier training
+  instance_count: 1
+  max_runtime_seconds: 7200 # 2 hours
+  # Base hyperparameters (can be overridden by execution input)
+  hyperparameters:
+    Prophet:
+      prophet_changepoint_prior_scale: 0.05
+      prophet_seasonality_prior_scale: 10.0
+      prophet_holidays_prior_scale: 10.0
+      prophet_daily_seasonality: True
+      prophet_weekly_seasonality: True
+      prophet_yearly_seasonality: 'auto'
+      # prophet_regressors: ["temperature_c", "is_holiday_flag"] # Example if using regressors
+    XGBoost:
+      xgb_eta: 0.1
+      xgb_max_depth: 5
+      xgb_num_boost_round: 150
+      xgb_subsample: 0.7
+      xgb_colsample_bytree: 0.7
+      # feature_columns must align with feature_engineering output for XGBoost
+      feature_columns_string: "temperature_c,solar_irradiance_ghi,humidity,is_holiday_flag,hour_of_day,day_of_week,day_of_month,month_of_year,consumption_lag_24h,consumption_lag_168h,consumption_roll_avg_24h"
+
+# --- Evaluation Workflow ---
+edf_evaluation:
+  instance_type: "ml.m5.large"
+  instance_count: 1
+  # Metrics thresholds for the 'CheckEvaluation' choice state
+  metrics_thresholds:
+    max_mape: 20.0 # Example: Fail if MAPE > 20%
+    max_rmse: 5.0  # Example: Fail if RMSE > 5 kWh (adjust based on typical consumption)
+  # Optional: Path to historical labelled data for backtesting
+  # historical_labels_path: "s3://..."
+
+# --- Inference Workflow ---
+edf_inference:
+  scheduler_expression: "cron(0 5 * * ? *)" # 5 AM UTC Daily
+  scheduler_timezone: "UTC"
+  forecast_horizon_hours: 72
+  # Processing job instance types (can override training defaults if needed)
+  feature_eng_instance_type: "ml.m5.large"
+  feature_eng_instance_count: 1
+  forecast_gen_instance_type: "ml.m5.large" # Needs forecasting libs installed
+  forecast_gen_instance_count: 1
+  # Target DB Config
+  forecast_db_type: "TIMESTREAM" # TIMESTREAM | RDS | DYNAMODB
+  # Lambda Config
+  load_forecasts_lambda_memory: 512 # MB
+  load_forecasts_lambda_timeout: 300 # seconds
+
+# --- Common Lambda Config ---
+# Assuming shared Lambdas from AD are used
+lambda_shared:
+   get_model_memory: 128
+   get_model_timeout: 30
+   create_sm_model_memory: 128
+   create_sm_model_timeout: 60
